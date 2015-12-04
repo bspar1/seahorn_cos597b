@@ -6,6 +6,8 @@
 
 An LLVM based verification framework.
 
+Modified by Ben and Ting-Jung.
+
 #License#
 SeaHorn is distributed under a modified BSD license. See [license.txt](license.txt) for details.
 
