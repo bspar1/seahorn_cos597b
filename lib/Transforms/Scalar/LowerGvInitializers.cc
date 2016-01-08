@@ -9,8 +9,10 @@ namespace seahorn
 {
   char LowerGvInitializers::ID = 0;
   
-  bool LowerGvInitializers::runOnModule (Module &M)
-  {
+  bool LowerGvInitializers::runOnModule (Module &M) {
+
+    const DataLayout* DL = &getAnalysis<DataLayoutPass>().getDataLayout ();
+
     Function *f = M.getFunction ("main");
     if (!f) return false;
     
@@ -18,7 +20,8 @@ namespace seahorn
     
     Builder.SetInsertPoint (&f->getEntryBlock (), 
                             f->getEntryBlock ().begin ());
-    
+
+    bool change=false;
     for (GlobalVariable &gv : boost::make_iterator_range (M.global_begin (),
                                                           M.global_end ()))
     {
@@ -27,16 +30,20 @@ namespace seahorn
       if (!ty) continue;
       Type *ety = ty->getElementType ();
       // only deal with scalars for now
-      if (!ety->isIntegerTy () &&  !ety->isPointerTy ()) continue;
+      if (!ety->isIntegerTy ()) continue;
+      
+      IntegerType* ity = cast<IntegerType> (ety);
       
       // -- create a store instruction
-      Builder.CreateStore (gv.getInitializer (), &gv);
+      Builder.CreateAlignedStore (gv.getInitializer (), &gv, 
+                                  DL->getABITypeAlignment (ity));
+      change=true;
     }
       
-    return false;
+    return change;
   }
 
 }
 
 static llvm::RegisterPass<seahorn::LowerGvInitializers>
-X ("lower-gv-init", "Lower initialization of global variables\n");
+X ("lower-gv-init", "Lower initialization of global variables");

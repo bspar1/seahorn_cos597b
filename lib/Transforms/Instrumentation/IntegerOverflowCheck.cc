@@ -1,7 +1,26 @@
 /* 
- * Instrument a program to add signed integer overflow/underflow
- * checks.  
+ * Insert signed integer overflow/underflow checks.
+
+ * Limitation: this pass adds checks for all arithmetic operations
+ * regardless whether they refer to signed or unsigned operands. The
+ * reason is because LLVM does not keep signedeness information for
+ * these operands.
  */
+
+/*
+  FIXME: the checks are inserted *after* the arithmetic operation has
+  been executed. This is OK assuming the bitecode is not executed but
+  only used for analysis purposes.  Nevertheless it would be safer if
+  we simply add the following checks:
+
+    a + b : add *before* check (a > MAX - b) and check (a < MIN - b)
+    a - b : add *before* check (a > MAX + b) and check (a < MIN + b)
+    a * b : add *before* check (a > MAX / b) and check (a < MIN / b)
+    a / b : add *before* check (a > MAX * b) and check (a < MIN * b)
+    for shift operations can be done as it is now but insert the check
+    *before* the operation.
+    for srem we can just check if MIN srem - 1
+*/
 
 #include "seahorn/Transforms/Instrumentation/IntegerOverflowCheck.hh"
 
@@ -10,16 +29,14 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/CommandLine.h"
-
 #include "llvm/ADT/APInt.h"
 
-#include <boost/optional.hpp>
 #include "avy/AvyDebug.h"
 
 static llvm::cl::opt<bool>
-InlineChecks("ioc-inline-all",
-             llvm::cl::desc ("Insert checks assuming all functions have been inlined."),
-             llvm::cl::init (false));
+HasErrorFunc("overflow-check-has-error-function",
+             llvm::cl::desc ("Available verifier.error function to denote error."),
+             llvm::cl::init (true));
 
 namespace seahorn
 {
@@ -27,22 +44,42 @@ namespace seahorn
 
   char IntegerOverflowCheck::ID = 0;
 
+  BasicBlock* IntegerOverflowCheck::createErrorBlock (Function &F, 
+                                                      IRBuilder<> B, 
+                                                      bool IsOverflow) {
+    BasicBlock* errBB = 
+        BasicBlock::Create(B.getContext (), 
+                           (IsOverflow ? "OverflowError" :  "UnderflowError"), 
+                           &F);
+                                             
+    B.SetInsertPoint (errBB);    
+    CallInst * CI = B.CreateCall (ErrorFn);
+    B.CreateUnreachable ();
+    
+    // update call graph
+    if (CG) {
+      auto f1 = CG->getOrInsertFunction (&F);
+      auto f2 = CG->getOrInsertFunction (ErrorFn);
+        f1->addCalledFunction (CallSite (CI), f2);
+    }
+    return errBB;
+  }
+
   std::pair<Value*,Value*> getBounds (LLVMContext &ctx, Type *ty)
   {
-    IntegerType *ity = dyn_cast<IntegerType> (ty);
-    assert (ty && "Value should be an integer");
-    
+    assert (ty->isIntegerTy ());
+
+    IntegerType *ity = cast<IntegerType> (ty);
     APInt lb = APInt::getSignedMinValue (ity->getBitWidth ());
     APInt ub = APInt::getSignedMaxValue (ity->getBitWidth ());
-
     return std::make_pair ( ConstantInt::get (ctx, lb),
                             ConstantInt::get (ctx, ub) );
   }
 
-   bool IntegerOverflowCheck::instrumentVal (Value *res, Type* ty,
-                                             IRBuilder<> B,
-                                             LLVMContext &ctx,
-                                             Instruction& inst)
+   bool IntegerOverflowCheck::insertIntegerCheck (Value *res, Type* ty,
+                                                  IRBuilder<> B,
+                                                  LLVMContext &ctx,
+                                                  Instruction& inst)
    {
      assert (!inst.isTerminator ());
      BasicBlock::iterator it = &inst;
@@ -58,53 +95,58 @@ namespace seahorn
      
      B.SetInsertPoint (Cont0->getFirstNonPHI ());    
      
-     Value* Cmp1 = B.CreateICmpSGE (res, 
-                                    bounds.first,
-                                    "IOC_underflow");
-     
+     Value* Underflow = B.CreateICmpSGE (res, 
+                                         bounds.first,
+                                         "underflow_check");
+
+     if (Instruction* UnderflowI = dyn_cast<Instruction> (Underflow)) {
+       UnderflowI->setDebugLoc (inst.getDebugLoc ());     
+       LOG ("overflow-check",
+            errs () << "Added " << *UnderflowI << "\n";);
+       ChecksAdded++;
+     }
+
      BasicBlock *OldBB1 = Cont0;
      BasicBlock *Cont1 = OldBB1->splitBasicBlock(B.GetInsertPoint ());
      OldBB1->getTerminator ()->eraseFromParent();
-     BranchInst::Create (Cont1, m_err_bb, Cmp1, OldBB1);
+
+     BasicBlock* UnderflowErrBB = createErrorBlock (*inst.getParent ()->getParent (), B, false);
+     BranchInst::Create (Cont1, UnderflowErrBB, Underflow, OldBB1);
      
      B.SetInsertPoint (Cont1->getFirstNonPHI ());    
      
-     Value* Cmp2 = B.CreateICmpSLE (res, 
-                                    bounds.second,
-                                    "IOC_overflow");
-     
+     Value* Overflow = B.CreateICmpSLE (res, 
+                                        bounds.second,
+                                        "overflow_check");
+
+     if (Instruction* OverflowI = dyn_cast<Instruction> (Overflow)) {
+       OverflowI->setDebugLoc (inst.getDebugLoc ());     
+       LOG ("overflow-check",
+            errs () << "Added " << *OverflowI << "\n";);
+       ChecksAdded++;
+     }
+
      BasicBlock *OldBB2 = Cont1;
      BasicBlock *Cont2 = OldBB2->splitBasicBlock(B.GetInsertPoint ());
      OldBB2->getTerminator ()->eraseFromParent();
-     BranchInst::Create (Cont2, m_err_bb, Cmp2, OldBB2);
+     BasicBlock* OverflowErrBB = createErrorBlock (*inst.getParent ()->getParent (), B, true);
+     BranchInst::Create (Cont2, OverflowErrBB, Overflow, OldBB2);
      
-     ChecksAdded++;
      return true;
 
    }
 
-   void IntegerOverflowCheck::instrumentErrAndSafeBlocks (IRBuilder<>B, 
-                                                          Function &F)
-   {
+   void IntegerOverflowCheck::addErrorAndSafeLocs (IRBuilder<>B, Function &F)  {
+         
+     // --- Here we assume that we cannot use verifier.error to
+     //     denote error.  Then, the original return statement is replaced
+     //     with a block with an infinite loop while a fresh block
+     //     named ERROR returning an arbitrary value is created. All
+     //     unsafe checks jump to ERROR.  The original program has
+     //     been fully inlined and the only function is "main" which
+     //     should return an integer.
      
-     LLVMContext &ctx = B.getContext ();
-     
-     if (!m_inline_all)
-     {
-       m_err_bb = BasicBlock::Create(ctx, "Error", &F);
-       B.SetInsertPoint (m_err_bb);    
-       B.CreateCall (m_errorFn);
-       B.CreateUnreachable ();
-       return;
-     } 
-    
-     // The original return statement is replaced with a block with an
-     // infinite loop while a fresh block named ERROR returning an
-     // arbitrary value is created. All unsafe checks jump to ERROR.
-     // The original program has been fully inlined and the only
-     // function is "main" which should return an integer.
-     
-     BasicBlock * retBB = nullptr;
+     BasicBlock *retBB = nullptr;
      ReturnInst *retInst = nullptr;
      for (BasicBlock& bb : F)
      {
@@ -115,13 +157,15 @@ namespace seahorn
          break;
        }
      }
+
+     LLVMContext &ctx = B.getContext ();
      
      if (!retInst)
      {     
        if (F.getReturnType ()->isIntegerTy ())
        {
-         m_err_bb = BasicBlock::Create(ctx, "Error", &F);
-         B.SetInsertPoint (m_err_bb);    
+         ErrorBB = BasicBlock::Create(ctx, "ERROR", &F);
+         B.SetInsertPoint (ErrorBB);    
          B.CreateRet ( ConstantInt::get (F.getReturnType (), 42)); 
        }
        else
@@ -134,8 +178,8 @@ namespace seahorn
        
        if (retVal && retVal->getType ()->isIntegerTy ())
        {
-         m_err_bb = BasicBlock::Create(ctx, "ERROR", &F);
-         B.SetInsertPoint (m_err_bb);    
+         ErrorBB = BasicBlock::Create(ctx, "ERROR", &F);
+         B.SetInsertPoint (ErrorBB);    
          B.CreateRet ( ConstantInt::get (retVal->getType (), 42));
        }
        else 
@@ -148,9 +192,9 @@ namespace seahorn
        
        B.SetInsertPoint (retInst);    
        BasicBlock::iterator It = B.GetInsertPoint ();
-       m_safe_bb = retBB->splitBasicBlock(It, "SAFE");
-       BranchInst *loopInst = BranchInst::Create(m_safe_bb);
-      ReplaceInstWithInst(retInst, loopInst);
+       SafeBB = retBB->splitBasicBlock(It, "SAFE");
+       BranchInst *loopInst = BranchInst::Create (SafeBB);
+       ReplaceInstWithInst(retInst, loopInst);
      }      
    }
 
@@ -158,28 +202,25 @@ namespace seahorn
   {
     if (F.isDeclaration ()) return false;
 
-    if (m_inline_all && !F.getName ().startswith ("main"))
-    {
-      errs () << "Warning: " << F.getName () << " is not instrumented.\n";
-      return false;
-    }
-
     LLVMContext &ctx = F.getContext ();
     IRBuilder<> B (ctx);
-      
-    instrumentErrAndSafeBlocks (B,F);
-    assert (m_err_bb);
+
+    if (!ErrorFn) {     
+      addErrorAndSafeLocs (B,F);
+    }
 
     bool change = false;
 
     std::vector<Instruction*> WorkList;
-    for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) 
-    {
+    for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
       Instruction *I = &*i;
-      if (isa<BinaryOperator> (I))
-      {
-        switch (I->getOpcode ())
-        {
+
+      // we don't cover for now vector integer operations
+      if (!I->getType()->isIntegerTy ())
+        continue;
+
+      if (isa<BinaryOperator> (I)) { 
+        switch (I->getOpcode ()) {
           case BinaryOperator::Add:
           case BinaryOperator::Sub:
           case BinaryOperator::Mul:
@@ -195,30 +236,22 @@ namespace seahorn
         WorkList.push_back (I);
     }
 
-    for (auto I : WorkList)
-    {
-      if (isa<BinaryOperator> (I))
-      {
-        switch (I->getOpcode ())
-        {
+    for (auto I : WorkList) {
+      if (isa<BinaryOperator> (I)) {
+        switch (I->getOpcode ()) {
           case BinaryOperator::Add:
           case BinaryOperator::Sub:
           case BinaryOperator::Mul:
           case BinaryOperator::Shl:  
           case BinaryOperator::SDiv: 
-          case BinaryOperator::SRem: 
-            {
-              change |= instrumentVal (I, I->getType (),
-                                       B, ctx, *I);
-              break;
-            }
+          case BinaryOperator::SRem: {
+            change |= insertIntegerCheck (I, I->getType (), B, ctx, *I);
+            break;
+          }
           default: ;
         }          
-      }
-      else if (TruncInst * TI = dyn_cast<TruncInst> (I))
-      {
-        change |= instrumentVal (TI->getOperand (0), TI->getOperand (1)->getType (),
-                                 B, ctx, *I);
+      } else if (TruncInst * TI = dyn_cast<TruncInst> (I)) {
+        change |= insertIntegerCheck (TI->getOperand (0), TI->getOperand (0)->getType (), B, ctx, *I);
       } 
     }
         
@@ -231,10 +264,7 @@ namespace seahorn
       
     LLVMContext &ctx = M.getContext ();
 
-    if (!m_inline_all) m_inline_all = InlineChecks;
-  
-    if (!m_inline_all)
-    {
+    if (HasErrorFunc) {
       AttrBuilder B;
       B.addAttribute (Attribute::NoReturn);
       B.addAttribute (Attribute::ReadNone);
@@ -243,20 +273,18 @@ namespace seahorn
                                            AttributeSet::FunctionIndex,
                                            B);
       
-      m_errorFn = dyn_cast<Function>
-        (M.getOrInsertFunction ("verifier.error",
-                                as,
-                                Type::getVoidTy (ctx), NULL));
+      ErrorFn = dyn_cast<Function>
+          (M.getOrInsertFunction ("verifier.error",
+                                  as,
+                                  Type::getVoidTy (ctx), NULL));
+    }
+    
+    bool change = false;
+    for (Function &F : M) {
+      change |= runOnFunction (F); 
     }
 
-    bool change = false;
-
-    for (Function &F : M) 
-      change |= runOnFunction (F); 
-
-    LOG( "ioc-verify", 
-         errs () << "[IOA] checks added: " << ChecksAdded << "\n");
-
+    errs () << "-- Inserted " << ChecksAdded << " signed integer overflow checks.\n";
     return change;
   }
     
@@ -264,12 +292,13 @@ namespace seahorn
   {
     AU.setPreservesAll ();
     AU.addRequired<llvm::UnifyFunctionExitNodes> ();
+    AU.addRequired<CallGraphWrapperPass> ();
+    AU.addPreserved<CallGraphWrapperPass> ();
   } 
-
-
-}
+} // end namespace
 
 static llvm::RegisterPass<seahorn::IntegerOverflowCheck> 
-X ("ioc", "Insert integer underflow/overflow checks");
+X ("overflow-check", 
+   "Insert integer underflow/overflow checks");
    
 
