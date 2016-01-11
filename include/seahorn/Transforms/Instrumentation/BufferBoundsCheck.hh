@@ -96,6 +96,11 @@ namespace seahorn
                                      Instruction* insertPoint, 
                                      const Value * ptr
                                      /*,DSGraph *dsg, DSGraph *gDsg*/);
+    void instrumentAllocaSize (Function *F,
+        IRBuilder<> B,
+        Instruction* insertPoint,
+        const Value * ptr,
+        ValueSet &visited);
     
     bool instrumentCheck (IRBuilder<> B, 
                           Instruction& insertPoint, 
