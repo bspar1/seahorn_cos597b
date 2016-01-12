@@ -295,16 +295,18 @@ void BufferBoundsCheck::instrumentSizeAndOffsetPtr (Function *F,
 			// bytes/element to get m_sizes[ptr] in bytes.
 			//ConstantInt *op_size_corrected = ConstantInt::get()
 
-			const ConstantInt *size_val = dyn_cast<ConstantInt>(shadowGepOpSize);
-			uint64_t base_int = size_val->getValue().getLimitedValue();
-			int size_bytes = size_val->getBitWidth() / 8;
-			// IntegerType *gep_size_type = size_val->getType();
-			Constant * gep_size_corrected = ConstantInt::get(m_Int64Ty, base_int * size_bytes);
-			m_sizes [ptr] = gep_size_corrected;
-
+			if (const ConstantInt *size_val = dyn_cast<ConstantInt>(shadowGepOpSize)) {
+				uint64_t base_int = size_val->getSExtValue();
+				int size_bytes = size_val->getBitWidth() / 8;
+				// IntegerType *gep_size_type = size_val->getType();
+				Constant * gep_size_corrected = ConstantInt::get(m_Int64Ty, base_int * size_bytes);
+				m_sizes [ptr] = gep_size_corrected;
+			}	else {
+				m_sizes[ptr] = shadowGepOpSize;
+			}
 			// For debugging
-			ConstantInt *gep_size_ci = dyn_cast<ConstantInt>(gep_size_corrected);
-			uint64_t gep_size_int = gep_size_ci->getValue().getLimitedValue();
+			//ConstantInt *gep_size_ci = dyn_cast<ConstantInt>(gep_size_corrected);
+			//uint64_t gep_size_int = gep_size_ci->getValue().getLimitedValue();
 
 			resolvePHIUsers (ptr, m_sizes);
 
@@ -329,11 +331,39 @@ void BufferBoundsCheck::instrumentSizeAndOffsetPtr (Function *F,
 		                              ptr->getName () + ".shadow.size" : ""),
 		                             insertPoint);
 
+		const Value *known_good = 0;
 		for (unsigned i = 0; i < PHI->getNumIncomingValues (); i++)
 		{
+			Instruction *curr_phi_val = dyn_cast<Instruction> (PHI->getIncomingValue (i));
+			if (!curr_phi_val)
+				curr_phi_val = PHI->getIncomingBlock (i)->getFirstNonPHI ();
+			ValueSet visited_2;
+
+			instrumentSizeAndOffsetPtr(F, B, insertPoint, curr_phi_val, visited_2);
 			// placeholder for now
-			shadowPHINodeOff->addIncoming (UndefValue::get (m_Int64Ty), PHI->getIncomingBlock (i));
-			shadowPHINodeSize->addIncoming (UndefValue::get (m_Int64Ty), PHI->getIncomingBlock (i));
+			// shadowPHINodeOff->addIncoming (UndefValue::get (m_Int64Ty), PHI->getIncomingBlock (i));
+			// shadowPHINodeSize->addIncoming (UndefValue::get (m_Int64Ty), PHI->getIncomingBlock (i));
+			const Value* cur_phi_val_val = dyn_cast<Value>(curr_phi_val);
+
+			// // Got a null response, so something couldn't be parsed.
+			// if (!m_offsets[cur_phi_val_val] || !m_sizes[cur_phi_val_val]){
+			// 	m_offsets[cur_phi_val_val] = m_offsets[known_good];
+			// 	m_sizes[cur_phi_val_val] = m_sizes[known_good];
+			// } else {
+			// 	known_good = cur_phi_val_val;
+			// }
+
+			if (!m_offsets[cur_phi_val_val]) {
+				m_offsets[cur_phi_val_val] = UndefValue::get (m_Int64Ty);
+				//m_offsets[cur_phi_val_val] = ConstantInt::get(m_Int64Ty, AliasAnalysis::UnknownSize);
+			}
+			if (!m_sizes[cur_phi_val_val]) {
+				m_sizes[cur_phi_val_val] = UndefValue::get (m_Int64Ty);
+				//m_sizes[cur_phi_val_val] = ConstantInt::get(m_Int64Ty,  AliasAnalysis::UnknownSize);
+			}
+			shadowPHINodeOff->addIncoming (m_offsets[cur_phi_val_val], PHI->getIncomingBlock(i));
+			shadowPHINodeSize->addIncoming (m_sizes[cur_phi_val_val], PHI->getIncomingBlock(i));
+
 		}
 
 
@@ -425,6 +455,28 @@ void BufferBoundsCheck::instrumentSizeAndOffsetPtr (Function *F,
 		}
 	}
 
+	if (const StoreInst *store_inst = dyn_cast<StoreInst>(ptr)) {
+		uint64_t Size = AliasAnalysis::UnknownSize;
+		if ((ptr->getType()->isPtrOrPtrVectorTy())) {
+			getObjectSize(ptr, Size, m_dl, m_tli, false);
+		}
+
+		if (!isUnknownSize(Size))
+		{
+			m_sizes [ptr] = ConstantInt::get (m_Int64Ty, Size);
+			m_offsets [ptr] = ConstantInt::get (m_Int64Ty, 0);
+			return;
+		} else {
+			const Value* next_pointer = store_inst->getValueOperand();
+			instrumentSizeAndOffsetPtr (F, B, insertPoint,
+			                            next_pointer,
+			                            visited);
+			m_sizes[ptr] = m_sizes[next_pointer];
+			m_offsets[ptr] = m_offsets[next_pointer];
+			return;
+		}
+	}
+
 	// binary operator, like i++
 	if (const BinaryOperator *bin_inst = dyn_cast<BinaryOperator> (ptr)) {
 		llvm::Instruction::BinaryOps opcode = bin_inst->getOpcode();
@@ -455,6 +507,19 @@ void BufferBoundsCheck::instrumentSizeAndOffsetPtr (Function *F,
 		}
 	}
 
+	if (const SelectInst *sel_inst = dyn_cast<SelectInst>(ptr)) {
+
+		// // create a PHI node
+		// PHINode* shadow_phi = PHINode::Create (m_Int64Ty,2,
+		//                             ((ptr->hasName ()) ?
+		//                              ptr->getName () + "select instruction" : ""),
+		//                             insertPoint);
+		// BasicBlock *parent = (BasicBlock *)dyn_cast<BasicBlock> (sel_inst->getParent());
+		// shadow_phi->addIncoming((Value *)sel_inst->getTrueValue(), parent);
+		// shadow_phi->addIncoming((Value *)sel_inst->getFalseValue(), parent);
+		// m_offsets[sel_inst] = ContantInt::get(m_Int64Ty, 0);
+	}
+
 	/// base cases
 	if (const ConstantInt *constant = dyn_cast<ConstantInt>(ptr)) {
 		m_sizes[ptr] = ConstantInt::get(m_Int64Ty, constant->getSExtValue());
@@ -476,8 +541,8 @@ void BufferBoundsCheck::instrumentSizeAndOffsetPtr (Function *F,
 
 				// m_sizes[ptr] = inst_val_int;
 				uint64_t var_val = inst_val_int->getSExtValue();
-				Type *var_type = inst_val_int->getType();
-				m_sizes[ptr] = ConstantInt::get(var_type, var_val);
+				// Type *var_type = inst_val_int->getType();
+				m_sizes[ptr] = ConstantInt::get(m_Int64Ty, var_val);
 				m_offsets[ptr] = ConstantInt::get (m_Int64Ty, 0);
 				return;
 			}
@@ -524,6 +589,7 @@ void BufferBoundsCheck::instrumentSizeAndOffsetPtr (Function *F,
 			}
 		}
 	}
+
 
 	if (const IntToPtrInst *IP = dyn_cast<IntToPtrInst> (ptr))
 	{
@@ -635,6 +701,16 @@ bool BufferBoundsCheck::instrumentCheck (IRBuilder<> B,
 	{
 		ChecksUnable++;
 		return false;
+	}
+
+	if (ConstantInt *size_ci = dyn_cast<ConstantInt>(ptrSize)) {
+		if (size_ci->getSExtValue() == AliasAnalysis::UnknownSize)
+			return false;
+	}
+
+	if (ConstantInt *offset_ci = dyn_cast<ConstantInt>(ptrOffset)) {
+		if (offset_ci->getSExtValue() == AliasAnalysis::UnknownSize)
+			return false;
 	}
 
 	B.SetInsertPoint (&inst);
