@@ -237,7 +237,8 @@ void BufferBoundsCheck::instrumentSizeAndOffsetPtr (Function *F,
         /*DSGraph *dsg, DSGraph *gDsg*/)
 {
 	//printf("Inside instrumentSizeAndOffsetPtr");
-	if (visited.find(ptr) != visited.end ())  return;
+	//const Value *tmp = visited.find(ptr);
+	//if (visited.find(ptr) != visited.end())  return;
 	visited.insert (ptr);
 
 	/// recursive cases
@@ -277,9 +278,30 @@ void BufferBoundsCheck::instrumentSizeAndOffsetPtr (Function *F,
 
 		instrumentGepOffset(B, insertPoint, Gep);
 
+		// For debugging - delete these for release
+		uint64_t offset_int = -1;
+		if (const ConstantInt *offset_val = dyn_cast<ConstantInt>(m_offsets[ptr])) {
+			offset_int = offset_val->getValue().getLimitedValue();
+		}
+		uint64_t Size = AliasAnalysis::UnknownSize;
+
 		if (Value* shadowGepOpSize = lookupSize(Gep->getPointerOperand ()))
 		{
-			m_sizes [ptr] = shadowGepOpSize;
+			// shadowGepOpSize is in number of elements, NOT in bytes.
+			// m_offsets[ptr] is in bytes. So multiply shadowGepOpSize by
+			// bytes/element to get m_sizes[ptr] in bytes.
+			//ConstantInt *op_size_corrected = ConstantInt::get()
+
+			const ConstantInt *size_val = dyn_cast<ConstantInt>(shadowGepOpSize);
+			uint64_t base_int = size_val->getValue().getLimitedValue();
+			int size_bytes = size_val->getBitWidth() / 8;
+			// IntegerType *gep_size_type = size_val->getType();
+			Constant * gep_size_corrected = ConstantInt::get(m_Int64Ty, base_int*size_bytes);
+			m_sizes [ptr] = gep_size_corrected;
+
+			// For debugging
+			ConstantInt *gep_size_ci = dyn_cast<ConstantInt>(gep_size_corrected);
+			uint64_t gep_size_int = gep_size_ci->getValue().getLimitedValue();
 
 			resolvePHIUsers (ptr, m_sizes);
 
@@ -358,25 +380,72 @@ void BufferBoundsCheck::instrumentSizeAndOffsetPtr (Function *F,
 		return;
 	}
 
-	/// base cases
-
-	if (isa<AllocaInst> (ptr) ||
-	        isa<GlobalVariable> (ptr) ||
-	        isa<LoadInst> (ptr) ||
-	        isAllocationFn (ptr, m_tli, true))
-	{
-
-		m_offsets [ptr] = ConstantInt::get (m_Int64Ty, 0);
-
-		// Only know the offset if it's a load instruction
-		if (const LoadInst *inst = dyn_cast<LoadInst>(ptr)) {
-			m_offsets [ptr] = ConstantInt::get (m_Int64Ty, 0);
-		}
+	if (const AllocaInst *alloca_inst = dyn_cast<AllocaInst> (ptr)) {
 
 		uint64_t Size = AliasAnalysis::UnknownSize;
 		getObjectSize(ptr, Size, m_dl, m_tli, false);
+		if (!isUnknownSize(Size))
+		{
+			m_sizes[ptr] = ConstantInt::get (m_Int64Ty, Size);
+			m_offsets[ptr] = ConstantInt::get (m_Int64Ty, 0);
+			return;
+		} else {
+			const Value* next_pointer = alloca_inst->getArraySize();
+			instrumentSizeAndOffsetPtr (F, B, insertPoint,
+			                            next_pointer,
+			                            visited);
+			m_sizes[ptr] = m_sizes[next_pointer];
+			m_offsets [ptr] = m_offsets[next_pointer];
+			return;
+		}
+	}
 
+	if (const LoadInst *load_inst = dyn_cast<LoadInst> (ptr)) {
+		uint64_t Size = AliasAnalysis::UnknownSize;
+		if ((ptr->getType()->isPtrOrPtrVectorTy())) {
+			getObjectSize(ptr, Size, m_dl, m_tli, false);
+		}
 
+		if (!isUnknownSize(Size))
+		{
+			m_sizes [ptr] = ConstantInt::get (m_Int64Ty, Size);
+			m_offsets [ptr] = ConstantInt::get (m_Int64Ty, 0);
+			return;
+		} else {
+			const Value* next_pointer = load_inst->getPointerOperand();
+			instrumentSizeAndOffsetPtr (F, B, insertPoint,
+			                            next_pointer,
+			                            visited);
+			m_sizes[ptr] = m_sizes[next_pointer];
+			m_offsets[ptr] = m_offsets[next_pointer];
+			return;
+		}
+	}
+
+	/// base cases
+	if (isa<GlobalVariable> (ptr) ||
+	        isAllocationFn (ptr, m_tli, true))
+	{
+
+		uint64_t Size = AliasAnalysis::UnknownSize;
+		//getObjectSize(ptr, Size, m_dl, m_tli, false);
+		if (const GlobalVariable *inst_global = dyn_cast<GlobalVariable>(ptr)) {
+			if (inst_global->hasInitializer()) {
+				bool is_const = inst_global->isConstant();
+				const Constant *inst_val = inst_global->getInitializer();
+				const ConstantInt *inst_val_int = dyn_cast<ConstantInt>(inst_val);
+				//getObjectSize(ptr, Size, m_dl, m_tli, false);
+
+				// m_sizes[ptr] = inst_val_int;
+				uint64_t var_val = inst_val_int->getValue().getLimitedValue();
+				Type *var_type = inst_val_int->getType();
+				m_sizes[ptr] = ConstantInt::get(var_type, var_val);
+				m_offsets[ptr] = ConstantInt::get (m_Int64Ty, 0);
+				return;
+			}
+		}
+
+		m_offsets [ptr] = ConstantInt::get (m_Int64Ty, 0);
 		if (!isUnknownSize(Size))
 		{
 			m_sizes [ptr] = ConstantInt::get (m_Int64Ty, Size);
@@ -390,7 +459,7 @@ void BufferBoundsCheck::instrumentSizeAndOffsetPtr (Function *F,
 			if (!inst->isStaticAlloca()) {
 				Instruction *insert_point = const_cast<Instruction*> (cast<Instruction> (inst));
 				ValueSet visited;
-				instrumentAllocaSize(F, B, insertPoint, ptr, visited);
+				//instrumentAllocaSize(F, B, insertPoint, ptr, visited);
 			}
 			// return;
 		}
