@@ -42,6 +42,8 @@
 #include "llvm/IR/CallSite.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/Instruction.h"
 
 #include <boost/optional.hpp>
 
@@ -280,9 +282,10 @@ void BufferBoundsCheck::instrumentSizeAndOffsetPtr (Function *F,
 
 		// For debugging - delete these for release
 		uint64_t offset_int = -1;
-		if (const ConstantInt *offset_val = dyn_cast<ConstantInt>(m_offsets[ptr])) {
-			offset_int = offset_val->getValue().getLimitedValue();
-		}
+		// if (const ConstantInt *offset_val = dyn_cast<ConstantInt>(m_offsets[ptr])) {
+		// 	offset_int = offset_val->getSExtValue();
+		// }
+
 		uint64_t Size = AliasAnalysis::UnknownSize;
 
 		if (Value* shadowGepOpSize = lookupSize(Gep->getPointerOperand ()))
@@ -296,7 +299,7 @@ void BufferBoundsCheck::instrumentSizeAndOffsetPtr (Function *F,
 			uint64_t base_int = size_val->getValue().getLimitedValue();
 			int size_bytes = size_val->getBitWidth() / 8;
 			// IntegerType *gep_size_type = size_val->getType();
-			Constant * gep_size_corrected = ConstantInt::get(m_Int64Ty, base_int*size_bytes);
+			Constant * gep_size_corrected = ConstantInt::get(m_Int64Ty, base_int * size_bytes);
 			m_sizes [ptr] = gep_size_corrected;
 
 			// For debugging
@@ -422,7 +425,42 @@ void BufferBoundsCheck::instrumentSizeAndOffsetPtr (Function *F,
 		}
 	}
 
+	// binary operator, like i++
+	if (const BinaryOperator *bin_inst = dyn_cast<BinaryOperator> (ptr)) {
+		llvm::Instruction::BinaryOps opcode = bin_inst->getOpcode();
+		Value *first_op = bin_inst->getOperand(0);
+		instrumentSizeAndOffsetPtr (F, B, insertPoint,
+		                            first_op,
+		                            visited);
+		Value *second_op = bin_inst->getOperand(1);
+		instrumentSizeAndOffsetPtr (F, B, insertPoint,
+		                            second_op,
+		                            visited);
+
+		// Either one of the ops is null, can't compute the sum
+		if (!m_sizes[first_op] || !m_sizes[second_op])
+			return;
+
+		ConstantInt *first_op_ci = dyn_cast<ConstantInt>(m_sizes[first_op]);
+		ConstantInt *second_op_ci = dyn_cast<ConstantInt>(m_sizes[second_op]);
+		uint64_t first_op_int = first_op_ci->getSExtValue();
+		uint64_t second_op_int = second_op_ci->getSExtValue();
+
+		if (opcode == llvm::Instruction::Add) {
+			m_sizes[ptr] = ConstantInt::get(m_Int64Ty, first_op_int + second_op_int);
+			m_offsets[ptr] = ConstantInt::get(m_Int64Ty, 0);
+		} else if (opcode == llvm::Instruction::Sub) {
+			m_sizes[ptr] = ConstantInt::get(m_Int64Ty, first_op_int + second_op_int);
+			m_offsets[ptr] = ConstantInt::get(m_Int64Ty, 0);
+		}
+	}
+
 	/// base cases
+	if (const ConstantInt *constant = dyn_cast<ConstantInt>(ptr)) {
+		m_sizes[ptr] = ConstantInt::get(m_Int64Ty, constant->getSExtValue());
+		m_offsets[ptr] = ConstantInt::get(m_Int64Ty, 0);
+	}
+
 	if (isa<GlobalVariable> (ptr) ||
 	        isAllocationFn (ptr, m_tli, true))
 	{
@@ -437,7 +475,7 @@ void BufferBoundsCheck::instrumentSizeAndOffsetPtr (Function *F,
 				//getObjectSize(ptr, Size, m_dl, m_tli, false);
 
 				// m_sizes[ptr] = inst_val_int;
-				uint64_t var_val = inst_val_int->getValue().getLimitedValue();
+				uint64_t var_val = inst_val_int->getSExtValue();
 				Type *var_type = inst_val_int->getType();
 				m_sizes[ptr] = ConstantInt::get(var_type, var_val);
 				m_offsets[ptr] = ConstantInt::get (m_Int64Ty, 0);
